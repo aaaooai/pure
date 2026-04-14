@@ -155,6 +155,15 @@ prompt_pure_preprompt_render() {
 	# psvar[19]: Command execution time.
 	psvar[19]=${prompt_pure_cmd_exec_time}
 
+	# psvar[21]: AWS profile name.
+	psvar[21]=${prompt_pure_aws_profile}
+
+	# psvar[22]: GCP project name.
+	psvar[22]=${prompt_pure_gcp_project}
+
+	# psvar[23]: Kubernetes context name.
+	psvar[23]=${prompt_pure_k8s_context}
+
 	# Expand the prompt for future comparison.
 	local expanded_prompt
 	expanded_prompt="${(S%%)PROMPT}"
@@ -210,6 +219,44 @@ prompt_pure_precmd() {
 		if [[ -n $IN_NIX_SHELL ]]; then
 			psvar[20]="${name:-nix-shell}"
 		fi
+	fi
+
+	# AWS profile integration (psvar[21]).
+	if zstyle -T ":prompt:pure:environment:aws" show; then
+		local aws_profile=${AWS_VAULT:-${AWS_PROFILE:-$AWS_DEFAULT_PROFILE}}
+		typeset -g prompt_pure_aws_profile=$aws_profile
+	else
+		typeset -g prompt_pure_aws_profile=
+	fi
+
+	# GCP project integration (psvar[22]).
+	if zstyle -T ":prompt:pure:environment:gcp" show; then
+		prompt_pure_cloud_async_init
+		local gcp_config=${CLOUDSDK_CONFIG:-~/.config/gcloud}
+		local gcp_cache=~/.cache/pure/gcp_cache
+		if [[ ${prompt_pure_last_gcp_config-} != $gcp_config || ! -f $gcp_cache || ${gcp_config}/config_sentinel -nt $gcp_cache ]]; then
+			typeset -g prompt_pure_last_gcp_config=$gcp_config
+			async_worker_eval "prompt_pure_cloud" export PATH=$PATH
+			async_worker_eval "prompt_pure_cloud" export CLOUDSDK_CONFIG=$gcp_config
+			async_job "prompt_pure_cloud" prompt_pure_async_gcp_project $gcp_cache
+		fi
+	else
+		typeset -g prompt_pure_gcp_project=
+	fi
+
+	# Kubernetes context integration (psvar[23]).
+	if zstyle -T ":prompt:pure:environment:kubernetes" show; then
+		prompt_pure_cloud_async_init
+		local kubeconfig=${KUBECONFIG:-~/.kube/config}
+		local k8s_cache=~/.cache/pure/k8s_cache
+		if [[ ${prompt_pure_last_kubeconfig-} != $kubeconfig || ! -f $k8s_cache || $kubeconfig -nt $k8s_cache ]]; then
+			typeset -g prompt_pure_last_kubeconfig=$kubeconfig
+			async_worker_eval "prompt_pure_cloud" export PATH=$PATH
+			async_worker_eval "prompt_pure_cloud" export KUBECONFIG=$kubeconfig
+			async_job "prompt_pure_cloud" prompt_pure_async_k8s_context $k8s_cache
+		fi
+	else
+		typeset -g prompt_pure_k8s_context=
 	fi
 
 	# Make sure VIM prompt is reset.
@@ -368,6 +415,22 @@ prompt_pure_async_git_stash() {
 	git rev-list --walk-reflogs --count refs/stash
 }
 
+prompt_pure_async_gcp_project() {
+	local cache=$1
+	local result
+	result=$(command gcloud config get-value project 2>/dev/null)
+	install -D /dev/null $cache 2>/dev/null
+	print -- $result
+}
+
+prompt_pure_async_k8s_context() {
+	local cache=$1
+	local result
+	result=$(command kubectl config current-context 2>/dev/null)
+	install -D /dev/null $cache 2>/dev/null
+	print -- $result
+}
+
 # Try to lower the priority of the worker so that disk heavy operations
 # like `git status` has less impact on the system responsivity.
 prompt_pure_async_renice() {
@@ -391,6 +454,57 @@ prompt_pure_async_init() {
 	async_start_worker "prompt_pure" -u -n
 	async_register_callback "prompt_pure" prompt_pure_async_callback
 	async_worker_eval "prompt_pure" prompt_pure_async_renice
+}
+
+prompt_pure_cloud_async_init() {
+	typeset -g prompt_pure_cloud_async_inited
+	if ((${prompt_pure_cloud_async_inited:-0})); then
+		return
+	fi
+	prompt_pure_cloud_async_inited=1
+	async_start_worker "prompt_pure_cloud" -u -n
+	async_register_callback "prompt_pure_cloud" prompt_pure_cloud_async_callback
+}
+
+prompt_pure_cloud_async_callback() {
+	local job=$1 code=$2 output=$3 next_pending=$6
+	local do_render=0
+
+	case $job in
+		\[async])
+			if (( code == 2 )) || (( code == 3 )) || (( code == 130 )); then
+				typeset -g prompt_pure_cloud_async_inited=0
+				async_stop_worker prompt_pure_cloud
+				prompt_pure_cloud_async_init
+			fi
+			;;
+		prompt_pure_async_gcp_project)
+			local prev=$prompt_pure_gcp_project
+			if (( code == 0 )); then
+				typeset -g prompt_pure_gcp_project=${output%%$'\n'*}
+			else
+				typeset -g prompt_pure_gcp_project=
+			fi
+			[[ $prev != $prompt_pure_gcp_project ]] && do_render=1
+			;;
+		prompt_pure_async_k8s_context)
+			local prev=$prompt_pure_k8s_context
+			if (( code == 0 )); then
+				typeset -g prompt_pure_k8s_context=${output%%$'\n'*}
+			else
+				typeset -g prompt_pure_k8s_context=
+			fi
+			[[ $prev != $prompt_pure_k8s_context ]] && do_render=1
+			;;
+	esac
+
+	if (( next_pending )); then
+		(( do_render )) && typeset -g prompt_pure_async_render_requested=1
+		return
+	fi
+
+	[[ ${prompt_pure_async_render_requested:-$do_render} = 1 ]] && prompt_pure_preprompt_render
+	unset prompt_pure_async_render_requested
 }
 
 prompt_pure_async_tasks() {
@@ -820,6 +934,9 @@ prompt_pure_setup() {
 		user                 242
 		user:root            default
 		virtualenv           242
+		aws                  242
+		gcp                  242
+		kubernetes           242
 	)
 	prompt_pure_colors=("${(@kv)prompt_pure_colors_default}")
 
@@ -856,6 +973,9 @@ prompt_pure_setup() {
 	#   psvar[18] = git stash flag, renders stash symbol
 	#   psvar[19] = exec time (e.g. 1d 3h 2m 5s)
 	#   psvar[20] = virtualenv/conda/nix-shell name
+	#   psvar[21] = AWS profile name
+	#   psvar[22] = GCP project name
+	#   psvar[23] = Kubernetes context name
 	#
 	# Example output:
 	#   ✦ user@host ~/Code/pure main* rebase ⇣⇡ ≡ 3s
@@ -870,6 +990,9 @@ prompt_pure_setup() {
 	PROMPT+='%(17V. %F{$prompt_pure_colors[git:arrow]}%17v%f.)'
 	PROMPT+='%(18V. %F{$prompt_pure_colors[git:stash]}${PURE_GIT_STASH_SYMBOL:-≡}%f.)'
 	PROMPT+='%(19V. %F{$prompt_pure_colors[execution_time]}%19v%f.)'
+	PROMPT+='%(21V. %F{$prompt_pure_colors[aws]}%21v%f.)'
+	PROMPT+='%(22V. %F{$prompt_pure_colors[gcp]}%22v%f.)'
+	PROMPT+='%(23V. %F{$prompt_pure_colors[kubernetes]}%23v%f.)'
 
 	# Newline separating preprompt from prompt.
 	PROMPT+='${prompt_newline}'
